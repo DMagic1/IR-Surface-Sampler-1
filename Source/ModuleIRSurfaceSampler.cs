@@ -28,6 +28,7 @@ using System.Collections.Generic;
 using System.Collections;
 using System.Linq;
 using UnityEngine;
+using KSP.UI.Screens.Flight.Dialogs;
 
 namespace IRSurfaceSampler
 {
@@ -51,9 +52,17 @@ namespace IRSurfaceSampler
 		private ScienceExperiment surfaceExp;
 		private ScienceExperiment asteroidExp;
 		private List<ScienceData> dataList = new List<ScienceData>();
+		private ExperimentsResultDialog resultsDialog;
 
 		private const string potato = "PotatoRoid";
 		private const string asteroidExperimentID = "asteroidSample";
+
+		public override void OnAwake()
+		{
+			GameEvents.onGamePause.Add(onPause);
+			GameEvents.onGameUnpause.Add(onUnPause);
+			GameEvents.onVesselStandardModification.Add(OnVesselModified);
+		}
 
 		public override void OnStart(PartModule.StartState state)
 		{
@@ -76,7 +85,6 @@ namespace IRSurfaceSampler
 					soundSource = part.gameObject.AddComponent<AudioSource>();
 					soundSource.rolloffMode = AudioRolloffMode.Logarithmic;
 					soundSource.dopplerLevel = 0f;
-					soundSource.panLevel = 1f;
 					soundSource.maxDistance = 10f;
 					soundSource.playOnAwake = false;
 					soundSource.loop = false;
@@ -112,7 +120,7 @@ namespace IRSurfaceSampler
 		}
 
 		//Update the KSPEvents and check for asteroids nearby; run only twice per second
-		private void Update()
+		new public void Update()
 		{
 			if (HighLogic.LoadedSceneIsFlight && FlightGlobals.ready)
 			{
@@ -124,15 +132,31 @@ namespace IRSurfaceSampler
 				if (((Time.time * deltaTime) - lastUpdate) > updateInterval)
 				{
 					lastUpdate = Time.time;
-					if (asteroidInRange() && !Deployed)
-						Events["DeployExperiment"].active = true;
-					else if ((vessel.situation == Vessel.Situations.LANDED || vessel.situation == Vessel.Situations.SPLASHED || vessel.situation == Vessel.Situations.PRELAUNCH) && !Deployed)
-						Events["DeployExperiment"].active = true;
-					else
+					if (Deployed)
 						Events["DeployExperiment"].active = false;
+					else
+					{
+						if (asteroidInRange())
+							Events["DeployExperiment"].active = true;
+						else if (vessel.situation == Vessel.Situations.LANDED || vessel.situation == Vessel.Situations.SPLASHED || vessel.situation == Vessel.Situations.PRELAUNCH)
+							Events["DeployExperiment"].active = true;
+					}
+
 					eventsCheck();
 				}
 			}
+		}
+
+		private void onPause()
+		{
+			if (resultsDialog != null)
+				resultsDialog.gameObject.SetActive(false);
+		}
+
+		private void onUnPause()
+		{
+			if (resultsDialog != null)
+				resultsDialog.gameObject.SetActive(true);
 		}
 
 		//We update all the KSPEvents to make sure they are available when they should be
@@ -140,8 +164,11 @@ namespace IRSurfaceSampler
 		{
 			Events["ResetExperiment"].active = dataList.Count > 0;
 			Events["ReviewDataEvent"].active = dataList.Count > 0;
-			Events["ResetExperimentExternal"].active = dataList.Count > 0;
-			Events["CollectDataExternalEvent"].active = dataList.Count > 0;
+			Events["ResetExperimentExternal"].active = dataList.Count > 0 && resettableOnEVA;
+			Events["CollectDataExternalEvent"].active = dataList.Count > 0 && dataIsCollectable;
+			Events["DeployExperimentExternal"].active = Events["DeployExperiment"].active;
+			Events["CleanUpExperimentExternal"].active = Inoperable;
+			Events["TransferDataEvent"].active = hasContainer && dataIsCollectable && dataList.Count > 0;
 		}
 
 		//This overrides the base Deploy Experiment event, if the drill distance checks out it starts a timer to begin the experiment
@@ -251,42 +278,6 @@ namespace IRSurfaceSampler
 			Vector3 pos = t.position;
 			Ray ray = new Ray(pos, t.forward);
 
-			//This section handles any changes in the part's size by TweakScale
-			//If the TweakScale module uses the free scale resize option the value will be
-			//reported as a percentage, rather than an multiplier
-			if (part.Modules.Contains("TweakScale"))
-			{
-				PartModule pM = part.Modules["TweakScale"];
-				if (pM.Fields.GetValue("currentScale") != null)
-				{
-					bool free = false;
-					if (pM.Fields.GetValue("isFreeScale") != null)
-					{
-						try
-						{
-							free = pM.Fields.GetValue<bool>("isFreeScale");
-						}
-						catch (Exception e)
-						{
-							Debug.LogError("[IRSurfaceSampler] Error in detecting TweakScale type; asuming not freeScale : " + e);
-						}
-					}
-					float tweakedScale = 1f;
-					try
-					{
-						tweakedScale = pM.Fields.GetValue<float>("currentScale");
-						//Divide by 100 if the tweakscale value returns a percentage
-						if (free)
-							tweakedScale /= 100;
-					}
-					catch (Exception e)
-					{
-						Debug.LogError("[IRSurfaceSampler] Error in detecting TweakScale component; reset distance scale to 1 : " + e);
-					}
-					scale *= tweakedScale;
-				}
-			}
-
 			Physics.Raycast(ray, out hit, scale);
 
 			if (hit.collider != null)
@@ -313,17 +304,20 @@ namespace IRSurfaceSampler
 				}
 
 				Transform hitT = hit.collider.transform;
+                Transform vesselMainbodyT = vessel.mainBody.GetTransform(); 
 				int i = 0;
 
 				//This loop keeps moving up the chain looking for a transform with a name that matches the current celestial body's name; it stops at a certain point
-				while (hitT != null && i < 100)
+
+                while (hitT != null && i < 100)
 				{
-					if (hitT.name.Contains(vessel.mainBody.name))
+                    if (hitT.name.Contains(vesselMainbodyT.name))
 						return true;
 					hitT = hitT.parent;
 					i++;
 				}
 			}
+
 
 			return false;
 		}
@@ -394,7 +388,7 @@ namespace IRSurfaceSampler
 				if (sub == null)
 					return null;
 
-				data = new ScienceData(exp.baseValue * exp.dataScale, this.xmitDataScalar, 0f, sub.id, sub.title);
+				data = new ScienceData(exp.baseValue * exp.dataScale, this.xmitDataScalar, 0f, sub.id, sub.title, false, part.flightID);
 
 				return data;
 			}
@@ -444,6 +438,88 @@ namespace IRSurfaceSampler
 			}
 		}
 
+		new public void DeployExperimentExternal()
+		{
+			if (FlightGlobals.ActiveVessel.isEVA)
+			{
+				if (!ScienceUtil.RequiredUsageExternalAvailable(part.vessel, FlightGlobals.ActiveVessel, (ExperimentUsageReqs)usageReqMaskExternal, surfaceExp, ref usageReqMessage))
+					ScreenMessages.PostScreenMessage("IR Surface Sampler does not meet the requirements for EVA experiment deployment", 6f, ScreenMessageStyle.UPPER_LEFT);
+				else
+					DeployExperiment();
+			}
+		}
+
+		new public void TransferDataEvent()
+		{
+			if (PartItemTransfer.Instance != null)
+			{
+				ScreenMessages.PostScreenMessage("<b><color=orange>A transfer is already in progress.</color></b>", 3f, ScreenMessageStyle.UPPER_CENTER);
+				return;
+			}
+
+			ExperimentTransfer.Create(part, this, new Callback<PartItemTransfer.DismissAction, Part>(transferData));
+		}
+
+		private void transferData(PartItemTransfer.DismissAction dismiss, Part p)
+		{
+			if (dismiss != PartItemTransfer.DismissAction.ItemMoved)
+				return;
+
+			if (p == null)
+				return;
+
+			if (dataList.Count <= 0)
+			{
+				ScreenMessages.PostScreenMessage(string.Format("[{0}]: has no data to transfer.", part.partInfo.title), 6, ScreenMessageStyle.UPPER_CENTER);
+				return;
+			}
+
+			ModuleScienceContainer container = p.FindModuleImplementing<ModuleScienceContainer>();
+
+			if (container == null)
+			{
+				ScreenMessages.PostScreenMessage(string.Format("<color=orange>[{0}]: {1} has no data container, canceling transfer.<color>", part.partInfo.title, p.partInfo.title), 6, ScreenMessageStyle.UPPER_CENTER);
+				return;
+			}
+
+			if (!rerunnable)
+			{
+				List<DialogGUIBase> dialog = new List<DialogGUIBase>();
+				dialog.Add(new DialogGUIButton<ModuleScienceContainer>("Remove Data", new Callback<ModuleScienceContainer>(onTransferData), container));
+				dialog.Add(new DialogGUIButton("Cancel", null, true));
+
+				PopupDialog.SpawnPopupDialog(
+					new Vector2(0.5f, 0.5f),
+					new Vector2(0.5f, 0.5f),
+					new MultiOptionDialog(
+						collectWarningText,
+						part.partInfo.title + "Warning!",
+						UISkinManager.defaultSkin,
+						dialog.ToArray()
+						),
+					false,
+					UISkinManager.defaultSkin,
+					true,
+					""
+					);
+			}
+			else
+				onTransferData(container);
+		}
+
+		private void onTransferData(ModuleScienceContainer target)
+		{
+			if (target == null)
+				return;
+
+			int i = dataList.Count;
+
+			if (target.StoreData(new List<IScienceDataContainer> { this }, false))
+				ScreenMessages.PostScreenMessage(string.Format("[{0}]: {1} Data stored.", target.part.partInfo.title, i), 6, ScreenMessageStyle.UPPER_LEFT);
+			else
+				ScreenMessages.PostScreenMessage(string.Format("<color=orange>[{0}]: Not all data was stored.</color>", target.part.partInfo.title), 6, ScreenMessageStyle.UPPER_LEFT);
+		}
+
 		/* These methods handle generating and interacting with the science results page */
 
 		private void newResultPage()
@@ -451,13 +527,14 @@ namespace IRSurfaceSampler
 			if (dataList.Count > 0)
 			{
 				ScienceData data = dataList[0];
-				ExperimentResultDialogPage page = new ExperimentResultDialogPage(part, data, data.transmitValue, xmitDataScalar / 2f, !rerunnable, transmitWarningText, true, data.labBoost < 1 && checkLabOps() && xmitDataScalar < 1, new Callback<ScienceData>(onDiscardData), new Callback<ScienceData>(onKeepData), new Callback<ScienceData>(onTransmitData), new Callback<ScienceData>(onSendToLab));
-				ExperimentsResultDialog.DisplayResult(page);
+				ExperimentResultDialogPage page = new ExperimentResultDialogPage(part, data, data.baseTransmitValue, 0, !rerunnable, transmitWarningText, true, new ScienceLabSearch(vessel, data), new Callback<ScienceData>(onDiscardData), new Callback<ScienceData>(onKeepData), new Callback<ScienceData>(onTransmitData), new Callback<ScienceData>(onSendToLab));
+				resultsDialog = ExperimentsResultDialog.DisplayResult(page);
 			}
 		}
 
 		private void onDiscardData(ScienceData data)
 		{
+			resultsDialog = null;
 			if (dataList.Count > 0)
 			{
 				dataList.Remove(data);
@@ -467,43 +544,38 @@ namespace IRSurfaceSampler
 
 		private void onKeepData(ScienceData data)
 		{
+			resultsDialog = null;
 		}
 
 		private void onTransmitData(ScienceData data)
 		{
-			List<IScienceDataTransmitter> tranList = vessel.FindPartModulesImplementing<IScienceDataTransmitter>();
-			if (tranList.Count > 0 && dataList.Count > 0)
+			resultsDialog = null;
+			IScienceDataTransmitter bestTransmitter = ScienceUtil.GetBestTransmitter(vessel);
+
+			if (bestTransmitter != null)
 			{
-				tranList.OrderBy(ScienceUtil.GetTransmitterScore).First().TransmitData(new List<ScienceData> { data });
+				bestTransmitter.TransmitData(new List<ScienceData> { data });
 				DumpData(data);
 			}
+			else if (CommNet.CommNetScenario.CommNetEnabled)
+				ScreenMessages.PostScreenMessage("No usable, in-range Comms Devices on this vessel. Cannot Transmit Data.", 3f, ScreenMessageStyle.UPPER_CENTER);
+			
 			else
-				ScreenMessages.PostScreenMessage("No transmitters available on this vessel.", 4f, ScreenMessageStyle.UPPER_LEFT);
+				ScreenMessages.PostScreenMessage("No Comms Devices on this vessel. Cannot Transmit Data.", 3f, ScreenMessageStyle.UPPER_CENTER);
 		}
 
 		private void onSendToLab(ScienceData data)
 		{
-			List<ModuleScienceLab> labList = vessel.FindPartModulesImplementing<ModuleScienceLab>();
-			if (checkLabOps() && dataList.Count > 0)
-				labList.OrderBy(ScienceUtil.GetLabScore).First().StartCoroutine(labList.First().ProcessData(data, new Callback<ScienceData>(onComplete)));
-			else
-				ScreenMessages.PostScreenMessage("No operational lab modules on this vessel. Cannot analyze data.", 4f, ScreenMessageStyle.UPPER_CENTER);
-		}
+			resultsDialog = null;
+			ScienceLabSearch labSearch = new ScienceLabSearch(vessel, data);
 
-		private void onComplete(ScienceData data)
-		{
-			ReviewData();
-		}
-
-		private bool checkLabOps()
-		{
-			List<ModuleScienceLab> labList = vessel.FindPartModulesImplementing<ModuleScienceLab>();
-			for (int i = 0; i < labList.Count; i++)
+			if (labSearch.NextLabForDataFound)
 			{
-				if (labList[i].IsOperational())
-					return true;
+				StartCoroutine(labSearch.NextLabForData.ProcessData(data, null));
+				DumpData(data);
 			}
-			return false;
+			else
+				labSearch.PostErrorToScreen();
 		}
 
 		/* These methods handle the IScienceDataContainer Interface which is used by external modules to access
@@ -524,6 +596,11 @@ namespace IRSurfaceSampler
 			return IsRerunnable();
 		}
 
+		void IScienceDataContainer.ReturnData(ScienceData data)
+		{
+			ReturnData(data);
+		}
+
 		void IScienceDataContainer.ReviewData()
 		{
 			ReviewData();
@@ -537,6 +614,17 @@ namespace IRSurfaceSampler
 		void IScienceDataContainer.DumpData(ScienceData data)
 		{
 			DumpData(data);
+		}
+
+		new private void ReturnData(ScienceData data)
+		{
+			if (data == null)
+				return;
+
+			dataList.Add(data);
+
+			Inoperable = false;
+			Deployed = true;
 		}
 
 		new private void DumpData(ScienceData data)
